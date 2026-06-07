@@ -1,45 +1,31 @@
 #!/usr/bin/env python3
 """
-fastq2tracks v3.1.0 — Sample sheet validator
+fastq2tracks v3.0.4 — Sample sheet validator (patched: tech-replicate aware)
 Usage: python3 scripts/validate_samplesheet.py [--check-files] samplesheet.csv
 
-Schema changes:
-  v3.1.0: chipqc_annotation column removed (17-column schema).
-          Old 18-column samplesheets (with chipqc_annotation) are still accepted
-          and validated correctly — the column is ignored by the pipeline.
-  v3.0.4: Duplicate sample_id is ALLOWED when tech_replicate values differ.
-          The enforced unique key is (sample_id, replicate, tech_replicate).
-          Within a tech-replicate group (same sample_id + replicate) all metadata
-          columns except fastq_1, fastq_2, and tech_replicate must be identical.
-          True duplicate rows (all fields identical) still fail.
-          Duplicate composite keys still fail.
-          control_id cross-reference uses the unique_sids set (unchanged semantics).
+Changes vs v3.0.2:
+  - Duplicate sample_id is ALLOWED when tech_replicate values differ.
+    The enforced unique key is (sample_id, replicate, tech_replicate).
+  - Within a tech-replicate group (same sample_id + replicate) all metadata
+    columns except fastq_1, fastq_2, and tech_replicate must be identical.
+  - True duplicate rows (all fields identical) still fail.
+  - Duplicate composite keys still fail.
+  - control_id cross-reference uses the unique_sids set (unchanged semantics).
 """
 import csv, sys, os, argparse
 
-# Current 17-column schema (v3.1.0+)
-REQUIRED_COLS_V31 = [
-    "sample_id","fastq_1","fastq_2","layout","genome",
-    "assay","factor","condition","treatment","cell_type",
-    "replicate","tech_replicate","is_control","control_id",
-    "macs2_mode","blacklist","output_prefix"
-]
-
-# Legacy 18-column schema (v3.0.x) — chipqc_annotation present but ignored by pipeline
-REQUIRED_COLS_V30 = [
+REQUIRED_COLS = [
     "sample_id","fastq_1","fastq_2","layout","genome",
     "assay","factor","condition","treatment","cell_type",
     "replicate","tech_replicate","is_control","control_id",
     "macs2_mode","blacklist","chipqc_annotation","output_prefix"
 ]
 
-# Columns that must be consistent within a (sample_id, replicate) tech-rep group
-CONSISTENT_COLS_V31 = [
+CONSISTENT_COLS = [
     "layout","genome","assay","factor","condition","treatment",
     "cell_type","is_control","control_id","macs2_mode","blacklist",
-    "output_prefix"
+    "chipqc_annotation","output_prefix"
 ]
-CONSISTENT_COLS_V30 = CONSISTENT_COLS_V31 + ["chipqc_annotation"]
 
 VALID_LAYOUTS = {"PE","SE"}
 VALID_GENOMES = {"hg38","mm39"}
@@ -50,47 +36,29 @@ def err(row, msg):  print(f"  [ERROR] row {row}: {msg}", file=sys.stderr); retur
 def warn(row, msg): print(f"  [WARN]  row {row}: {msg}")
 
 
-def detect_schema(fieldnames):
-    """Return (REQUIRED_COLS, CONSISTENT_COLS, schema_version_str)."""
-    if "chipqc_annotation" in fieldnames:
-        return REQUIRED_COLS_V30, CONSISTENT_COLS_V30, "v3.0.x (18-column, chipqc_annotation present — accepted, ignored by pipeline)"
-    return REQUIRED_COLS_V31, CONSISTENT_COLS_V31, "v3.1.0 (17-column)"
-
-
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("samplesheet")
     ap.add_argument("--check-files", action="store_true",
-                    help="Verify FASTQ/BED files exist on disk")
+                    help="Verify FASTQ/BED/RDS files exist on disk")
     args = ap.parse_args()
     errors = 0
     print(f"Validating: {args.samplesheet}")
 
     with open(args.samplesheet, newline="") as fh:
         reader = csv.DictReader(fh)
-        fieldnames = reader.fieldnames or []
-
-        required_cols, consistent_cols, schema_ver = detect_schema(fieldnames)
-        print(f"Schema detected      : {schema_ver}")
-
-        missing_cols = [c for c in required_cols if c not in fieldnames]
+        missing_cols = [c for c in REQUIRED_COLS if c not in (reader.fieldnames or [])]
         if missing_cols:
             print(f"[FATAL] Missing columns: {missing_cols}", file=sys.stderr)
             sys.exit(1)
-
         rows = list(reader)
 
-    composite_keys       = {}
-    seen_raw_rows        = {}
+    composite_keys       = {}   # (sid, rep, tech_rep) -> row-number
+    seen_raw_rows        = {}   # frozenset(row.items()) -> row-number
     unique_sids          = set()
     control_ids_declared = set()
-    ip_to_control        = {}
-    group_meta           = {}
-
-    # File-check columns: always check fastq_1, fastq_2, blacklist
-    # chipqc_annotation is intentionally excluded even in 18-col sheets —
-    # the file is no longer required by the pipeline
-    FILE_CHECK_COLS = ["fastq_1", "fastq_2", "blacklist"]
+    ip_to_control        = {}   # sid -> ctrl_id (first occurrence)
+    group_meta           = {}   # (sid, rep) -> {col: val, "first_row": N}
 
     for i, row in enumerate(rows, start=2):
         sid      = row["sample_id"].strip()
@@ -104,7 +72,7 @@ def main():
         else:
             seen_raw_rows[raw_key] = i
 
-        # Composite key uniqueness
+        # Composite key uniqueness (replaces bare sample_id check)
         comp = (sid, rep, tech_rep)
         if comp in composite_keys:
             errors += err(i, f"Duplicate composite key (sample_id='{sid}', "
@@ -142,7 +110,7 @@ def main():
         else:
             ctrl = row["control_id"].strip()
             if not ctrl:
-                warn(i, "IP sample has no control_id — MACS3 will run without control")
+                warn(i, "IP sample has no control_id — MACS2 will run without control")
             else:
                 ip_to_control[sid] = ctrl
 
@@ -157,19 +125,19 @@ def main():
             errors += err(i, f"tech_replicate must be integer, got '{tech_rep}'")
 
         if args.check_files:
-            for col in FILE_CHECK_COLS:
-                p = row.get(col, "").strip()
+            for col in ["fastq_1","fastq_2","blacklist","chipqc_annotation"]:
+                p = row[col].strip()
                 if p and not os.path.exists(p):
                     errors += err(i, f"File not found: {col}={p}")
 
         # Metadata consistency within tech-replicate group
         grp = (sid, rep)
-        meta_snap = {c: row[c].strip() for c in consistent_cols}
+        meta_snap = {c: row[c].strip() for c in CONSISTENT_COLS}
         if grp not in group_meta:
             group_meta[grp] = {"first_row": i, **meta_snap}
         else:
             ref = group_meta[grp]
-            mismatches = [c for c in consistent_cols if meta_snap[c] != ref[c]]
+            mismatches = [c for c in CONSISTENT_COLS if meta_snap[c] != ref[c]]
             if mismatches:
                 errors += err(i,
                     f"Inconsistent metadata within tech-replicate group "
